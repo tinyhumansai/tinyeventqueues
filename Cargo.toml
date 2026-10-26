@@ -61,7 +61,7 @@ async-trait = "0.1"
 serde_path_to_error = "0.1"
 # Preserve the legacy composite-key encoding in the owner while v2 exposes
 # only already-encoded `Key::new` values.
-sha2 = "0.10"
+sha2 = "0.11"
 data-encoding = "2"
 # Module integration tests exercise the real asynchronous in-memory TinyBus.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
