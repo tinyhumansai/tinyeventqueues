@@ -108,14 +108,16 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --all-targets --all-features
 cargo test --all-features
+# Build the cdylib before running default-feature native loader tests.
+cargo build --workspace
+cargo test
 cargo run -p tinyeventqueues --example basic
 .github/scripts/check-file-coverage.sh 90 coverage.json   # needs cargo-llvm-cov
 ```
 
-The module depends on the `tinystoragedrivers-api` and
-`tinystoragedrivers-types` contracts and the bus proxy, pinned to canonical
-TinyStorageDrivers v2.1.0. Storage engines are selected by the host and are not
-part of the module's library dependency tree.
+The module uses the v2 `tinystoragedrivers-api`, `-types`, and `-busproxy`
+contracts. Storage engines remain in the host; the testkit and queue memory
+backend are development dependencies only.
 
 ## Releasing
 

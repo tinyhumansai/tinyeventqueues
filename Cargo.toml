@@ -32,13 +32,13 @@ tinyeventqueues-bus = { path = "crates/tinyeventqueues-bus" }
 # TinyBus defines the message types, interface macro, and frozen module ABI
 # used by the generated integration. Socket and CLI features are unnecessary
 # here.
-tinybus = { version = ">=0.3.6, <0.4", default-features = false, features = [
+tinybus = { version = "0.3.12", default-features = false, features = [
     "macros",
     "modules",
 ] }
 # The module-side SDK owns the isolated runtime and exports the ABI entrypoints
 # required by TinyBus's dynamic loader.
-tinybus-module = ">=0.3.6, <0.4"
+tinybus-module = "0.3.12"
 # Derive macros for the crate-wide error type in
 # `crates/tinyeventqueues/src/error/`.
 thiserror = "2"
@@ -48,10 +48,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Stable v2 storage contracts and pure value types; engine implementations are
 # selected by the host rather than this queue owner.
-tinystoragedrivers-api = { git = "https://github.com/tinyhumansai/tinystoragedrivers", rev = "29471a164619bcec03e5858a7d7ee0c65f52bf22" }
-tinystoragedrivers-types = { git = "https://github.com/tinyhumansai/tinystoragedrivers", rev = "29471a164619bcec03e5858a7d7ee0c65f52bf22" }
+tinystoragedrivers-api = { version = "2.1.2", git = "https://github.com/tinyhumansai/tinystoragedrivers", rev = "c447da319e41dfe17bba4afb1831fe0cf0eef154" }
+tinystoragedrivers-types = { version = "2.1.2", git = "https://github.com/tinyhumansai/tinystoragedrivers", rev = "c447da319e41dfe17bba4afb1831fe0cf0eef154" }
 # Module-side adapters to host-owned storage ports.
-tinystoragedrivers-busproxy = { git = "https://github.com/tinyhumansai/tinystoragedrivers", rev = "29471a164619bcec03e5858a7d7ee0c65f52bf22" }
+tinystoragedrivers-busproxy = { version = "2.1.2", git = "https://github.com/tinyhumansai/tinystoragedrivers", rev = "c447da319e41dfe17bba4afb1831fe0cf0eef154" }
 # Module diagnostics; the host installs the logger.
 log = "0.4"
 # The host-callback trait (`Host`) is an async trait object.
@@ -109,9 +109,17 @@ tinybus-macros = { path = "vendor/tinybus/crates/tinybus-macros" }
 
 [patch."https://github.com/tinyhumansai/tinybus"]
 tinybus = { path = "vendor/tinybus/crates/tinybus" }
+tinybus-macros = { path = "vendor/tinybus/crates/tinybus-macros" }
+tinybus-module = { path = "vendor/tinybus/crates/tinybus-module" }
+
+[patch."https://github.com/tinyhumansai/tinybus?rev=6b3c5b0cc14b1d07b68055b17a937b11de613efd"]
+tinybus = { path = "vendor/tinybus/crates/tinybus" }
+tinybus-macros = { path = "vendor/tinybus/crates/tinybus-macros" }
+tinybus-module = { path = "vendor/tinybus/crates/tinybus-module" }
 
 [patch."https://github.com/senamakel/tinybus"]
 tinybus = { path = "vendor/tinybus/crates/tinybus" }
+
 
 [profile.release]
 # Cross-crate optimization and smaller, faster binaries for release builds.

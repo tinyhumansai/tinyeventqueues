@@ -1,4 +1,4 @@
-//! Tests for opening host-provided storage and refusing missing storage.
+//! Tests for the module's host-backed TSD v2 storage routes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -8,47 +8,57 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tinybus::Connection;
 use tinybus::broker::Broker;
 use tinybus::transport::memory::MemoryBus;
+use tinyeventqueues_bus::storage::OUTCOMES;
 use tinystoragedrivers_api::StorageBackend;
-use tinystoragedrivers_busproxy::{PerCallerEndpoint, StorageServer, serve};
-use tinystoragedrivers_types::Scope;
+use tinystoragedrivers_busproxy::{
+    PerCallerEndpoint, StorageAddress, StorageServer, connect_storage_at_address, serve_at_address,
+};
+use tinystoragedrivers_testkit::MemoryBackend;
+use tinystoragedrivers_types::{Precondition, Scope};
 
 use super::*;
-use crate::ports::ErrorKind;
+use crate::store::{collection_spec, collection_specs};
 use crate::tinybus_module::tests::rig;
 
 #[tokio::test]
-async fn a_missing_callback_is_refused_even_when_the_global_host_is_serving_storage() {
+async fn the_default_route_uses_the_host_scoped_storage_ports() {
     let rig = rig(true).await;
     let module = Connection::connect(rig.bus.connect().await.unwrap())
         .await
         .unwrap();
-    let refused = open(module, None).await;
-    assert!(matches!(
-        &refused,
-        Err(crate::Error::Storage(error)) if error.kind() == ErrorKind::Unavailable
-    ));
-    assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("storage_callback")
-    );
+    let backing = open(module, None).await.unwrap();
+
+    for declaration in collection_specs() {
+        let spec = collection_spec(declaration);
+        backing.docs.ensure_collection(&spec).await.unwrap();
+    }
+    backing
+        .docs
+        .put(
+            OUTCOMES,
+            "x",
+            serde_json::json!({"stored": true}),
+            Precondition::None,
+        )
+        .await
+        .unwrap();
+    let host = rig
+        .backend
+        .for_scope(&Scope::new("local").unwrap())
+        .unwrap();
+    assert!(host.documents().get(OUTCOMES, "x").await.unwrap().is_some());
 }
 
 #[tokio::test]
-async fn a_host_without_storage_refuses_setup_instead_of_using_memory() {
+async fn missing_or_unusable_global_storage_fails_setup() {
     let rig = rig(false).await;
     let module = Connection::connect(rig.bus.connect().await.unwrap())
         .await
         .unwrap();
     assert!(open(module, None).await.is_err());
-}
 
-#[tokio::test]
-async fn a_storage_host_that_cannot_be_reached_fails_setup_instead_of_using_memory() {
-    let rig = rig(false).await;
-    // Something owns the storage name but serves no storage objects: a host
-    // whose storage is present but failing.
+    // A host name without the storage objects is unavailable, not permission
+    // to acknowledge work in memory.
     rig.host
         .request_name(tinystoragedrivers_busproxy::HOST_NAME)
         .await
@@ -56,104 +66,137 @@ async fn a_storage_host_that_cannot_be_reached_fails_setup_instead_of_using_memo
     let module = Connection::connect(rig.bus.connect().await.unwrap())
         .await
         .unwrap();
-    let callback = rig.host.unique_name().unwrap();
-    let refused = open(module, Some(callback.as_str())).await;
-    assert!(refused.is_err(), "fell back to memory: {refused:?}");
-    assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("storage_callback")
-    );
+    assert!(open(module, None).await.is_err());
 }
 
 #[tokio::test]
-async fn an_unadmitted_storage_destination_does_not_fall_back_to_global_storage() {
+async fn an_explicit_invocation_address_never_falls_back_to_global_storage() {
+    let rig = rig(true).await;
+    let module = Connection::connect(rig.bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let host = rig.host.unique_name().unwrap().clone();
+    let address = StorageAddress::try_new(
+        host,
+        format!(
+            "{}/missing",
+            tinystoragedrivers_busproxy::INVOCATION_OBJECT_ROOT
+        )
+        .parse()
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(open(module, Some(address)).await.is_err());
+}
+
+#[tokio::test]
+async fn an_issued_invocation_address_is_caller_bound_and_revocable() {
     let bus = MemoryBus::new();
     Broker::new().spawn(bus.clone());
     let host = Connection::connect(bus.connect().await.unwrap())
         .await
         .unwrap();
-    let backend = Arc::new(tinystoragedrivers_testkit::MemoryBackend::new());
-    let providers = Arc::new(AtomicUsize::new(0));
-    let served_backend = Arc::clone(&backend);
-    let provider_calls = Arc::clone(&providers);
-    let endpoint = PerCallerEndpoint::new(move |_sender| {
-        provider_calls.fetch_add(1, Ordering::Relaxed);
-        let storage = served_backend.for_scope(&Scope::new("local").ok()?).ok()?;
-        Some(StorageServer::new(storage))
-    });
-    let _served = serve(&host, Arc::new(endpoint)).await.unwrap();
     let module = Connection::connect(bus.connect().await.unwrap())
         .await
         .unwrap();
+    let module_peer = module.unique_name().unwrap().clone();
+    let address = StorageAddress::try_new(
+        host.unique_name().unwrap().clone(),
+        format!(
+            "{}/event_queues_1",
+            tinystoragedrivers_busproxy::INVOCATION_OBJECT_ROOT
+        )
+        .parse()
+        .unwrap(),
+    )
+    .unwrap();
+    let backend = Arc::new(MemoryBackend::new());
+    let scope = Scope::new("event-queues-bound").unwrap();
+    let admitted_calls = Arc::new(AtomicUsize::new(0));
+    let endpoint_backend = Arc::clone(&backend);
+    let endpoint_scope = scope.clone();
+    let endpoint_peer = module_peer.clone();
+    let endpoint_calls = Arc::clone(&admitted_calls);
+    let endpoint = PerCallerEndpoint::new(move |sender| {
+        if sender != &endpoint_peer {
+            return None;
+        }
+        endpoint_calls.fetch_add(1, Ordering::Relaxed);
+        let storage = endpoint_backend.for_scope(&endpoint_scope).ok()?;
+        Some(StorageServer::new(storage))
+    });
+    let served = serve_at_address(&host, address.clone(), Arc::new(endpoint))
+        .await
+        .unwrap();
 
-    // The ordinary global host is live, but a caller-supplied callback name is
-    // an authority boundary and must be used as-is.
-    let refused = open(module, Some(":1.999999")).await;
-    assert!(matches!(
-        &refused,
-        Err(crate::Error::Storage(error)) if error.kind() == ErrorKind::Unavailable
-    ));
+    let backing = open(module.clone(), Some(address.clone())).await.unwrap();
+    for declaration in collection_specs() {
+        let spec = collection_spec(declaration);
+        backing.docs.ensure_collection(&spec).await.unwrap();
+    }
+    backing
+        .docs
+        .put(
+            OUTCOMES,
+            "bound",
+            serde_json::json!({"stored": true}),
+            Precondition::None,
+        )
+        .await
+        .unwrap();
+    let scoped = backend.for_scope(&scope).unwrap();
     assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("storage_callback")
+        scoped
+            .documents()
+            .get(OUTCOMES, "bound")
+            .await
+            .unwrap()
+            .is_some()
     );
-    assert_eq!(
-        providers.load(Ordering::Relaxed),
-        0,
-        "the rejected callback fell through to the global storage provider"
-    );
+
+    let outsider = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    assert!(connect_storage_at_address(outsider, address).await.is_err());
+    assert!(admitted_calls.load(Ordering::Relaxed) > 0);
+
+    served.shutdown().await.unwrap();
+    assert!(backing.docs.get(OUTCOMES, "bound").await.is_err());
 }
 
 #[tokio::test]
-async fn an_invalid_storage_destination_is_rejected_before_connecting() {
+async fn an_unattested_callback_is_refused_even_when_it_serves_storage() {
     let rig = rig(true).await;
     let module = Connection::connect(rig.bus.connect().await.unwrap())
         .await
         .unwrap();
-    let refused = open(module, Some("")).await;
-    assert!(matches!(
-        &refused,
-        Err(crate::Error::Storage(error)) if error.kind() == ErrorKind::Unavailable
-    ));
+    let result = open_callback(module, rig.host.unique_name().unwrap().clone()).await;
     assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("storage_callback")
+        result.is_err(),
+        "ordinary peers must not acquire callback authority"
     );
 }
 
 #[tokio::test]
-async fn the_shared_storage_service_name_reaches_the_host_serving_it() {
-    // A host that serves one storage service for every module names that
-    // service instead of a per-instance callback binding.
+async fn a_missing_callback_never_uses_working_global_storage() {
     let rig = rig(true).await;
     let module = Connection::connect(rig.bus.connect().await.unwrap())
         .await
         .unwrap();
-    let opened = open(module, Some(tinystoragedrivers_busproxy::HOST_NAME)).await;
-    assert!(
-        opened.is_ok(),
-        "the shared storage service was refused: {opened:?}"
-    );
+    let missing = tinybus::BusName::new(":1.999999").unwrap();
+    assert!(open_callback(module, missing).await.is_err());
 }
 
 #[tokio::test]
-async fn the_shared_storage_service_name_fails_setup_when_nobody_serves_it() {
-    let rig = rig(false).await;
+async fn a_well_known_callback_name_cannot_borrow_working_global_storage() {
+    let rig = rig(true).await;
     let module = Connection::connect(rig.bus.connect().await.unwrap())
         .await
         .unwrap();
-    let refused = open(module, Some(tinystoragedrivers_busproxy::HOST_NAME)).await;
-    assert!(refused.is_err(), "fell back to memory: {refused:?}");
-    assert!(
-        refused
-            .unwrap_err()
-            .to_string()
-            .contains("storage_callback")
-    );
+    let peer = BusName::new("ai.tinyhumans.tinystorage").unwrap();
+    let error = open_callback(module, peer).await.unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("storage_callback"), "{message}");
+    assert!(message.contains("expected a unique host peer"), "{message}");
 }
