@@ -5,21 +5,27 @@
 //!
 //! ```json
 //! {
-//!   "storage_callback": ":1.42",
+//!   "storage_address": {
+//!     "host": ":1.42",
+//!     "object_root": "/ai/tinyhumans/tinystorage/Invocation/abc123"
+//!   },
 //!   "queues":   { "version": 1, "queues": [ ... ] },
 //!   "pipeline": { "version": 1, ... },
 //!   "timer":    { "enabled": true, "min_interval_ms": 100, "max_interval_ms": 5000 }
 //! }
 //! ```
 //!
-//! `storage_callback` is the unique destination of the storage callback
-//! admitted by the host for this module instance, or the shared storage
-//! service name (`ai.tinyhumans.tinystorage.Storage`) of a host that serves one
-//! storage service for every module. `queues` is a `queues.json`
-//! document and `pipeline` a `pipeline.json` document, both parsed as strictly
-//! as the files are. A host that serves the module's queues should declare the
-//! same manifest it passes here: its queue port admits an `EnsureQueue` only
-//! for the spec it declared.
+//! A `storage_callback` unique peer selects the host-bound callback endpoint.
+//! It is mutually exclusive with `storage_address`; an explicit route never
+//! falls back to global storage.
+//!
+//! `storage_address` identifies the host's invocation-scoped storage endpoint.
+//! Its unique peer and invocation root must be issued by the host. An explicit
+//! address never falls back to another storage route. `queues` is a
+//! `queues.json` document and `pipeline` a `pipeline.json` document, both parsed
+//! as strictly as the files are. A host that serves the module's queues should
+//! declare the same manifest it passes here: its queue port admits an
+//! `EnsureQueue` only for the spec it declared.
 
 use crate::config::{
     QueueManifest, parse_manifest, parse_pipeline_config, shipped_manifest, shipped_pipeline_config,
@@ -27,15 +33,20 @@ use crate::config::{
 use crate::{Error, Result};
 use serde::Deserialize;
 use serde_json::Value;
+use tinybus::{BusName, ObjectPath};
 use tinyeventqueues_bus::PipelineConfig;
+use tinystoragedrivers_busproxy::StorageAddress;
 
 /// The module configuration.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Settings {
-    /// The host-admitted `TinyBus` callback destination for storage.
+    /// A host-bound storage callback peer; never a module-selected alias.
     #[serde(default)]
-    pub(crate) storage_callback: Option<String>,
+    storage_callback: Option<String>,
+    /// Host-issued route for this module instance's scoped storage.
+    #[serde(default)]
+    storage_address: Option<StorageAddressConfig>,
     /// A `queues.json` document; the shipped one when absent.
     #[serde(default)]
     queues: Option<Value>,
@@ -45,6 +56,14 @@ pub(crate) struct Settings {
     /// The module-owned pass timer.
     #[serde(default)]
     pub(crate) timer: TimerSettings,
+}
+
+/// The JSON form of a host-issued invocation storage address.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StorageAddressConfig {
+    host: String,
+    object_root: String,
 }
 
 /// The pass timer: how often the module runs a pass on its own.
@@ -92,6 +111,54 @@ impl Settings {
             ));
         }
         Ok(settings)
+    }
+
+    /// Resolve the exact host callback peer without an invocation-route fallback.
+    ///
+    /// # Errors
+    /// Returns a configuration error for a non-unique peer or conflicting routes.
+    pub(crate) fn storage_callback(&self) -> Result<Option<BusName>> {
+        let Some(callback) = &self.storage_callback else {
+            return Ok(None);
+        };
+        if self.storage_address.is_some() {
+            return Err(Error::config(
+                "storage_callback",
+                "cannot combine callback and invocation storage routes",
+            ));
+        }
+        let peer = BusName::new(callback)
+            .map_err(|_| Error::config("storage_callback", "expected a unique host peer"))?;
+        if !peer.is_unique() {
+            return Err(Error::config(
+                "storage_callback",
+                "expected a unique host peer",
+            ));
+        }
+        Ok(Some(peer))
+    }
+
+    /// Validate and build the host-issued invocation storage address, if set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when the peer is not unique or the object root is
+    /// outside the invocation-scoped namespace.
+    pub(crate) fn storage_address(&self) -> Result<Option<StorageAddress>> {
+        let Some(config) = &self.storage_address else {
+            return Ok(None);
+        };
+        let host = BusName::new(&config.host)
+            .map_err(|_| Error::config("storage_address.host", "expected a unique bus name"))?;
+        let root = ObjectPath::new(&config.object_root).map_err(|_| {
+            Error::config(
+                "storage_address.object_root",
+                "expected an invocation object path",
+            )
+        })?;
+        StorageAddress::try_new(host, root)
+            .map(Some)
+            .map_err(|_| Error::config("storage_address", "invalid invocation storage address"))
     }
 
     /// The queue manifest to run.
